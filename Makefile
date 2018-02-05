@@ -1,5 +1,5 @@
 # Customize here
-NAME=couch_http_patch
+NAME=couchdb_binder
 VERSION=1.0.0
 # Stop customizing here
 
