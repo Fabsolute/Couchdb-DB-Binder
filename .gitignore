@@ -2,3 +2,6 @@
 .rebar/
 ebin/
 *.iml
+couch/
+
+*.tar.gz

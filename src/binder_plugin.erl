@@ -1,1 +1,0 @@
--module(binder_plugin).

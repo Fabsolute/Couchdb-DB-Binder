@@ -1,9 +1,0 @@
-%% -*- mode: erlang -*-
-{application, binder_plugin, [
-    {description, "Binder CouchDB Plugin"},
-    {vsn, "0.0.0"},
-    {modules, []},
-    {registered, []},
-    {applications, [kernel, stdlib]},
-    {env, []}
-]}.
