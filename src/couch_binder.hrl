@@ -10,8 +10,8 @@
 
 -record(binding, {
   id,
-  source,
-  target,
-  user_ctx,
+  db_one,
+  db_many,
+  field_one,
   doc_id
 }).

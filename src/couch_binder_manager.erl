@@ -25,8 +25,6 @@ to_binary/1
 -record(binding_state, {
   binding,
   starting,
-  retries_left,
-  max_retries,
   wait = ?INITIAL_WAIT
 }).
 
@@ -34,8 +32,7 @@ to_binary/1
   changes_feed_loop = nil,
   db_notifier = nil,
   binding_db_name = nil,
-  binding_start_pids = [],
-  max_retries
+  binding_start_pids = []
 }).
 
 -define(DOC_TO_BINDING, couch_binder_doc_to_binder).
@@ -72,7 +69,12 @@ changes_feed_loop() ->
       ),
       ChangesFeedFun(
         fun({change, Change, _}, _) ->
-          gen_server:call(Server, {db_changed, Change}, infinity);
+          case has_valid_binder_id(Change) of
+            true ->
+              ok = gen_server:call(Server, {db_changed, Change}, infinity);
+            false ->
+              ok
+          end;
           (_, _) ->
             ok
         end
@@ -155,7 +157,7 @@ on_changes(State, {Change}) ->
 
 binder_db_update_error(Error, DocId) ->
   case Error of
-    {bad_rep_doc, Reason} ->
+    {bad_binding_doc, Reason} ->
       ok;
     _ ->
       Reason = to_binary(Error)
@@ -174,8 +176,8 @@ update_binder_doc(DocId, KVs) ->
         ok
     end
   catch throw:conflict ->
-    % Shouldn't happen, as by default only the role _replicator can
-    % update replication documents.
+    % Shouldn't happen, as by default only the role binding can
+    % update binding documents.
     ?LOG_ERROR("Conflict error when updating binding document `~s`. Retrying.", [DocId]),
     ok = timer:sleep(5),
     update_binder_doc(DocId, KVs)
@@ -187,15 +189,15 @@ update_binder_doc(BindingDb, #doc{body = {BindingDocBody}} = BindingDoc, KVs) ->
   NewBindingDocBody = lists:foldl(
     fun({K, undefined}, Body) ->
       lists:keydelete(K, 1, Body);
-      ({<<"_replication_state">> = K, State} = KV, Body) ->
+      ({<<"binding_state">> = K, State} = KV, Body) ->
         case get_value(K, Body) of
           State ->
             Body;
           _ ->
             Body1 = lists:keystore(K, 1, Body, KV),
             lists:keystore(
-              <<"_replication_state_time">>, 1, Body1,
-              {<<"_replication_state_time">>, timestamp()})
+              <<"binding_state_time">>, 1, Body1,
+              {<<"binding_state_time">>, timestamp()})
         end;
       ({K, _V} = KV, Body) ->
         lists:keystore(K, 1, Body, KV)
@@ -205,7 +207,7 @@ update_binder_doc(BindingDb, #doc{body = {BindingDocBody}} = BindingDoc, KVs) ->
     BindingDocBody ->
       ok;
     _ ->
-      % Might not succeed - when the replication doc is deleted right
+      % Might not succeed - when the binding doc is deleted right
       % before this update (not an error, ignore).
       couch_db:update_doc(BindingDb, BindingDoc#doc{body = {NewBindingDocBody}}, [])
   end.
@@ -227,15 +229,14 @@ pp_binding_id({Base, Extension}) ->
   Base ++ Extension.
 
 
-maybe_start_binding(State, DocId, BindingDoc) ->
-  #binding{id = {BaseId, _} = BindingId} = Binding = parse_binding_doc(BindingDoc),
+maybe_start_binding(State, DocId, {BindingDoc}) ->
+  Binding = parse_binding_doc(BindingDoc),
+  #binding{id = {BaseId, _} = BindingId} = Binding,
   case binding_state(BindingId) of
     nil ->
       RepState = #binding_state{
         binding = Binding,
-        starting = true,
-        retries_left = State#state.max_retries,
-        max_retries = State#state.max_retries
+        starting = true
       },
       true = ets:insert(?BINDING_TO_STATE, {BindingId, RepState}),
       true = ets:insert(?DOC_TO_BINDING, {DocId, BindingId}),
@@ -259,14 +260,42 @@ maybe_start_binding(State, DocId, BindingDoc) ->
 parse_binding_doc(BindingDoc) ->
   {ok, Binding} =
     try
-      parse_binding_doc(BindingDoc, binding_user_ctx(BindingDoc))
+      {ok,
+        #binding{
+          db_one = get_value(<<"db_one">>, BindingDoc),
+          db_many = get_value(<<"db_many">>, BindingDoc),
+          field_one = get_value(<<"field_one">>, BindingDoc),
+          doc_id = get_value(<<"_id">>, BindingDoc),
+          id = {couch_util:to_hex(couch_util:md5(couch_server:get_uuid())), couch_util:to_hex(couch_util:md5(couch_server:get_uuid()))}
+        }
+      }
     catch
       throw:{error, Reason} ->
-        throw({bad_rep_doc, Reason});
+        throw({bad_binding_doc, Reason});
       Tag:Err ->
-        throw({bad_rep_doc, to_binary({Tag, Err})})
+        throw({bad_binding_doc, to_binary({Tag, Err})})
     end,
   Binding.
+
+
+timestamp() ->
+  {{Year, Month, Day}, {Hour, Min, Sec}} = calendar:now_to_local_time(now()),
+  UTime = erlang:universaltime(),
+  LocalTime = calendar:universal_time_to_local_time(UTime),
+  DiffSecs = calendar:datetime_to_gregorian_seconds(LocalTime) -
+    calendar:datetime_to_gregorian_seconds(UTime),
+  zone(DiffSecs div 3600, (DiffSecs rem 3600) div 60),
+  iolist_to_binary(
+    io_lib:format("~4..0w-~2..0w-~2..0wT~2..0w:~2..0w:~2..0w~s",
+      [Year, Month, Day, Hour, Min, Sec,
+        zone(DiffSecs div 3600, (DiffSecs rem 3600) div 60)])).
+
+zone(Hr, Min) when Hr >= 0, Min >= 0 ->
+  io_lib:format("+~2..0w:~2..0w", [Hr, Min]);
+zone(Hr, Min) ->
+  io_lib:format("-~2..0w:~2..0w", [abs(Hr), abs(Min)]).
+
+
 
 binding_state(BindingId) ->
   erlang:error(not_implemented).
@@ -277,8 +306,9 @@ start_binding(Binding, N) ->
 maybe_tag_binding_doc(DocId, BindingDoc, L2b) ->
   erlang:error(not_implemented).
 
-binding_user_ctx(BindingDoc) ->
-  erlang:error(not_implemented).
-
-parse_binding_doc({Props}, UserCtx) ->
-  erlang:error(not_implemented).
+has_valid_binder_id({Change}) ->
+  has_valid_binder_id(get_value(<<"id">>, Change));
+has_valid_binder_id(<<?DESIGN_DOC_PREFIX, _Rest/binary>>) ->
+  false;
+has_valid_binder_id(_Else) ->
+  true.
