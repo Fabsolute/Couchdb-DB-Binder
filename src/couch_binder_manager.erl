@@ -29,9 +29,8 @@ to_binary/1
 }).
 
 -record(state, {
-  changes_feed_loop = nil,
-  db_notifier = nil,
-  binding_db_name = nil,
+  changes_listener = nil,
+  binder_db_name = nil,
   binding_start_pids = []
 }).
 
@@ -39,59 +38,51 @@ to_binary/1
 -define(BINDING_TO_STATE, couch_binder_binder_to_state).
 
 %% API
--export([init/1, start_link/0, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
+-export([init/1, start_link/0, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3, has_valid_binder_id/1]).
 
 start_link() ->
+  initialize_supervisors(),
   gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
 init(_) ->
   process_flag(trap_exit, true),
-  {Loop, BinderDbName} = changes_feed_loop(),
-  {ok, [{loop, Loop}, {db, BinderDbName}]}.
+  {Listener, BinderDbName} = changes_feed_loop(),
+  {ok, #state{
+    changes_listener = Listener,
+    binder_db_name = BinderDbName
+  }}.
 
 changes_feed_loop() ->
+  ?LOG_INFO("changes_feed_loop", []),
   {ok, BinderDb} = ensure_binder_db_exists(),
   BinderDbName = couch_db:name(BinderDb),
   couch_db:close(BinderDb),
   Server = self(),
-  Pid = spawn_link(
+  Listener = #change_listener{
+    name = BinderDbName,
+
+    filter = fun has_valid_binder_id/1,
+    func =
+    fun(Change) ->
+      ok = gen_server:call(Server, {db_changed, Change}, infinity)
+    end
+  },
+  spawn_link(
     fun() ->
-      DbOpenOptions = [{user_ctx, BinderDb#db.user_ctx}, sys_db],
-      {ok, Db} = couch_db:open_int(BinderDbName, DbOpenOptions),
-      ChangesFeedFun = couch_changes:handle_changes(
-        #changes_args{
-          include_docs = true,
-          feed = "continuous",
-          timeout = infinity
-        },
-        {json_req, null},
-        Db
-      ),
-      ChangesFeedFun(
-        fun({change, Change, _}, _) ->
-          case has_valid_binder_id(Change) of
-            true ->
-              ok = gen_server:call(Server, {db_changed, Change}, infinity);
-            false ->
-              ok
-          end;
-          (_, _) ->
-            ok
-        end
-      )
+      ?LOG_INFO("before couch_binder_change_listener:add_listener(~w, ~w)", [BinderDbName, Listener]),
+      couch_binder_change_listener:add_listener(BinderDbName, Listener),
+      ?LOG_INFO("after couch_binder_change_listener:add_listener(BinderDbName, Listener)", []),
+      ?LOG_INFO("before couch_binder_change_listener:start(~w)", [BinderDbName]),
+      couch_binder_change_listener:start(BinderDbName),
+      ?LOG_INFO("after couch_binder_change_listener:start(BinderDbName)", [])
     end
   ),
-  {Pid, BinderDbName}.
+  ?LOG_INFO("return changes_feed_loop", []),
+  {Listener, BinderDbName}.
 
 ensure_binder_db_exists() ->
   DbName = ?l2b(couch_config:get("binder", "db", "binders")),
-  UserCtx = #user_ctx{roles = [<<"_admin">>]},
-  case couch_db:open_int(DbName, [sys_db, {user_ctx, UserCtx}, nologifmissing]) of
-    {ok, Db} ->
-      Db;
-    _Error ->
-      {ok, Db} = couch_db:create(DbName, [sys_db, {user_ctx, UserCtx}])
-  end,
+  {ok, Db} = couch_binder_change_listener:ensure_db_exists(DbName, false),
   ensure_binder_ddoc_exists(Db, <<"_design/binders">>),
   {ok, Db}.
 
@@ -158,7 +149,7 @@ on_changes(State, {Change}) ->
 binder_db_update_error(Error, DocId) ->
   case Error of
     {bad_binding_doc, Reason} ->
-      ok;
+      Reason = Reason;
     _ ->
       Reason = to_binary(Error)
   end,
@@ -176,8 +167,6 @@ update_binder_doc(DocId, KVs) ->
         ok
     end
   catch throw:conflict ->
-    % Shouldn't happen, as by default only the role binding can
-    % update binding documents.
     ?LOG_ERROR("Conflict error when updating binding document `~s`. Retrying.", [DocId]),
     ok = timer:sleep(5),
     update_binder_doc(DocId, KVs)
@@ -234,19 +223,18 @@ maybe_start_binding(State, DocId, {BindingDoc}) ->
   #binding{id = {BaseId, _} = BindingId} = Binding,
   case binding_state(BindingId) of
     nil ->
-      RepState = #binding_state{
+      BindingState = #binding_state{
         binding = Binding,
         starting = true
       },
-      true = ets:insert(?BINDING_TO_STATE, {BindingId, RepState}),
+      true = ets:insert(?BINDING_TO_STATE, {BindingId, BindingState}),
       true = ets:insert(?DOC_TO_BINDING, {DocId, BindingId}),
-      ?LOG_INFO("Attempting to start binding `~s` (document `~s`).",
-        [pp_binding_id(BindingId), DocId]),
+      ?LOG_INFO("Attempting to start binding `~s` (document `~s`).", [pp_binding_id(BindingId), DocId]),
       Pid = spawn_link(fun() -> start_binding(Binding, 0) end),
       State#state{binding_start_pids = [Pid | State#state.binding_start_pids]};
     #binding_state{binding = #binding{doc_id = DocId}} ->
       State;
-    #binding_state{starting = false, binding = #binding{doc_id = OtherDocId}} ->
+    #binding_state{starting = false, binding = #binding{doc_id = OtherDocId}} -> % todo id must generate by document content for conflict
       ?LOG_INFO("The binding specified by the document `~s` was already triggered by the document `~s`", [DocId, OtherDocId]),
       maybe_tag_binding_doc(DocId, BindingDoc, ?l2b(BaseId)),
       State;
@@ -298,13 +286,30 @@ zone(Hr, Min) ->
 
 
 binding_state(BindingId) ->
-  erlang:error(not_implemented).
+  case ets:lookup(?BINDING_TO_STATE, BindingId) of
+    [{BindingId, BindingState}] ->
+      BindingState;
+    [] ->
+      nil
+  end.
 
-start_binding(Binding, N) ->
-  erlang:error(not_implemented).
 
-maybe_tag_binding_doc(DocId, BindingDoc, L2b) ->
-  erlang:error(not_implemented).
+start_binding(Binding, Wait) ->
+  ok = timer:sleep(Wait * 1000),
+  case (catch couch_binder:async_binding(Binding)) of
+    {ok, _} ->
+      ok;
+    Error ->
+      binding_error(Binding, Error)
+  end.
+
+maybe_tag_binding_doc(DocId, {BindingProps}, BindingId) ->
+  case get_value(<<"binding_id">>, BindingProps) of
+    BindingId -> ok;
+    _ ->
+      update_binding_doc(DocId, [{<<"binding_id">>, BindingId}])
+  end.
+
 
 has_valid_binder_id({Change}) ->
   has_valid_binder_id(get_value(<<"id">>, Change));
@@ -312,3 +317,83 @@ has_valid_binder_id(<<?DESIGN_DOC_PREFIX, _Rest/binary>>) ->
   false;
 has_valid_binder_id(_Else) ->
   true.
+
+
+
+binding_error(#binding{id = {BaseId, _} = BindingId}, Error) ->
+  case binding_state(BindingId) of
+    nil ->
+      ok;
+    #binding_state{binding = #binding{doc_id = DocId}} ->
+      update_binding_doc(DocId, [
+        {<<"binding_state">>, <<"error">>},
+        {<<"binding_state_reason">>, to_binary(error_reason(Error))},
+        {<<"binding_id">>, ?l2b(BaseId)}]),
+      ok = gen_server:call(?MODULE, {binding_error, BindingId, Error}, infinity)
+  end.
+
+
+error_reason({error, {Error, Reason}})
+  when is_atom(Error), is_binary(Reason) ->
+  io_lib:format("~s: ~s", [Error, Reason]);
+error_reason({error, Reason}) ->
+  Reason;
+error_reason(Reason) ->
+  Reason.
+
+update_binding_doc(BindingDocId, KVs) ->
+  {ok, BindingDb} = ensure_binder_db_exists(),
+  try
+    case couch_db:open_doc(BindingDb, BindingDocId, [ejson_body]) of
+      {ok, LatestBindingDoc} ->
+        update_binding_doc(BindingDb, LatestBindingDoc, KVs);
+      _ ->
+        ok
+    end
+  catch throw:conflict ->
+    ?LOG_ERROR("Conflict error when updating binding document `~s`. Retrying.", [BindingDocId]),
+    ok = timer:sleep(5),
+    update_binding_doc(BindingDocId, KVs)
+  after
+    couch_db:close(BindingDb)
+  end.
+
+
+update_binding_doc(BindingDb, #doc{body = {BindingDocBody}} = BindingDoc, KVs) ->
+  NewBindingDocBody = lists:foldl(
+    fun({K, undefined}, Body) ->
+      lists:keydelete(K, 1, Body);
+      ({<<"binding_state">> = K, State} = KV, Body) ->
+        case get_value(K, Body) of
+          State ->
+            Body;
+          _ ->
+            Body1 = lists:keystore(K, 1, Body, KV),
+            lists:keystore(
+              <<"binding_state_time">>, 1, Body1,
+              {<<"binding_state_time">>, timestamp()})
+        end;
+      ({K, _V} = KV, Body) ->
+        lists:keystore(K, 1, Body, KV)
+    end,
+    BindingDocBody, KVs),
+  case NewBindingDocBody of
+    BindingDocBody ->
+      ok;
+    _ ->
+      couch_db:update_doc(BindingDb, BindingDoc#doc{body = {NewBindingDocBody}}, [])
+  end.
+
+
+
+initialize_supervisors() ->
+  BinderJobSpec = {
+    couch_binder_job_sup,
+    {couch_binder_job_sup, start_link, []},
+    permanent,
+    infinity,
+    supervisor,
+    [couch_binder_job_sup]
+  },
+  ?LOG_INFO("Binder Job supervisor initializing", []),
+  couch_binder_job_sup:start_link().

@@ -15,3 +15,10 @@
   field_one,
   doc_id
 }).
+
+
+-record(change_listener, {
+  filter = nil,
+  name,
+  func
+}).

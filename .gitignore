@@ -3,5 +3,7 @@
 ebin/
 *.iml
 couch/
-
+couch_binder-*/
 *.tar.gz
+
+*.DS_Store
